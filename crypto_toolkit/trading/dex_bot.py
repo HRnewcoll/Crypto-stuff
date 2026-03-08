@@ -93,6 +93,8 @@ class DexBotReport:
     confidence: float = 0.5
     score: float = 0.0            # composite 0–100 score
     reasoning: list[str] = field(default_factory=list)
+    # Set by AIDexBot when an LLM provides an enhanced analysis
+    ai_reasoning: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -135,6 +137,7 @@ class DexBotReport:
             "confidence": self.confidence,
             "score": self.score,
             "reasoning": self.reasoning,
+            "ai_reasoning": self.ai_reasoning,
         }
 
     def to_text(self) -> str:
@@ -162,6 +165,8 @@ class DexBotReport:
             "",
             "Reasoning:",
         ] + [f"  • {r}" for r in self.reasoning]
+        if self.ai_reasoning:
+            lines += ["", "AI Analysis:", f"  {self.ai_reasoning}"]
         return "\n".join(lines)
 
 
@@ -654,3 +659,192 @@ class DexBot:
         top_early = sorted(early_wallet_volumes.values(), reverse=True)[:5]
         top_early_pct = sum(top_early) / (total_volume + 1e-9)
         return len(early) < 5 and top_early_pct > 0.60
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AIDexBot – LLM-powered variant of DexBot
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AIDexBot(DexBot):
+    """AI-enhanced DEX token analyser.
+
+    Extends :class:`DexBot` by feeding all collected on-chain, social, and risk
+    metrics to an LLM (OpenAI-compatible API) for deeper, reasoning-based
+    analysis.  When no API key is configured it falls back silently to the
+    parent heuristic scoring so it is always safe to call.
+
+    The LLM is asked to:
+      • Re-evaluate the buy/sell/avoid/hold recommendation.
+      • Provide a confidence score (0–1).
+      • Write a multi-sentence narrative explaining the reasoning.
+
+    The narrative is stored in ``DexBotReport.ai_reasoning`` and is also
+    appended to ``report.reasoning``.
+
+    Example::
+
+        bot = AIDexBot(model="gpt-4o-mini")
+        report = asyncio.run(bot.analyse("0xTOKEN…", chain="ethereum"))
+        print(report.ai_reasoning)
+        print(report.recommendation)   # potentially overridden by LLM
+    """
+
+    _SYSTEM_PROMPT = (
+        "You are an expert DeFi analyst and crypto trader.  "
+        "You are given structured data about a token collected from on-chain "
+        "analytics, social media, and security audits.  "
+        "Output ONLY a valid JSON object (no markdown, no extra text) with "
+        "exactly three keys:\n"
+        '  "recommendation": one of "buy", "sell", "hold", "avoid"\n'
+        '  "confidence": a float between 0.0 and 1.0\n'
+        '  "reasoning": a concise multi-sentence narrative (2–5 sentences) '
+        "explaining your decision, referencing the data provided."
+    )
+
+    def __init__(
+        self,
+        model: str = "gpt-4o-mini",
+        llm_timeout: int = 30,
+        **kwargs,
+    ) -> None:
+        """
+        Args:
+            model:       OpenAI-compatible model name (e.g. ``"gpt-4o"``,
+                         ``"gpt-4o-mini"``, ``"mistral-small"``).
+            llm_timeout: HTTP timeout in seconds for the LLM request.
+            **kwargs:    Forwarded to :class:`DexBot` (min_liquidity_usd, etc.).
+        """
+        super().__init__(**kwargs)
+        self.model = model
+        self.llm_timeout = llm_timeout
+
+    # ------------------------------------------------------------------
+    # Public API  (same signature as DexBot.analyse)
+    # ------------------------------------------------------------------
+
+    async def analyse(self, token_address: str, chain: str = "ethereum") -> DexBotReport:
+        """Run a full AI-enhanced analysis.
+
+        1. Collects all metrics via the parent ``DexBot`` pipeline.
+        2. Passes the full context to the configured LLM.
+        3. Merges the LLM's recommendation / confidence / reasoning into the
+           report, overriding the heuristic decision when the LLM responds.
+        4. On any LLM error (no key, timeout, bad JSON …) falls back silently
+           to the parent heuristic result.
+
+        Returns:
+            DexBotReport with ``ai_reasoning`` populated when the LLM call
+            succeeded.
+        """
+        report = await super().analyse(token_address, chain)
+        await self._enrich_with_llm(report)
+        return report
+
+    # ------------------------------------------------------------------
+    # LLM enrichment
+    # ------------------------------------------------------------------
+
+    async def _enrich_with_llm(self, report: DexBotReport) -> None:
+        """Query the LLM and update *report* in-place."""
+        from crypto_toolkit.config import OPENAI_API_KEY, OPENAI_BASE_URL
+
+        if not OPENAI_API_KEY:
+            # No key – stay with heuristic result
+            return
+
+        prompt = self._build_prompt(report)
+
+        try:
+            import json as _json
+            async with __import__("httpx").AsyncClient(timeout=self.llm_timeout) as client:
+                resp = await client.post(
+                    f"{OPENAI_BASE_URL}/chat/completions",
+                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": self._SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.2,
+                    },
+                )
+                resp.raise_for_status()
+                raw = resp.json()["choices"][0]["message"]["content"]
+
+            parsed = _json.loads(raw)
+            rec = parsed.get("recommendation", report.recommendation).lower()
+            if rec in {"buy", "sell", "hold", "avoid"}:
+                report.recommendation = rec
+            conf = parsed.get("confidence")
+            if conf is not None:
+                try:
+                    report.confidence = max(0.0, min(1.0, float(conf)))
+                except (ValueError, TypeError):
+                    pass
+            narrative = parsed.get("reasoning", "")
+            if narrative:
+                report.ai_reasoning = str(narrative)
+                report.reasoning = report.reasoning + [f"[AI] {narrative}"]
+
+        except Exception:
+            # Any failure (network, bad JSON, model error) → keep heuristic result
+            pass
+
+    # ------------------------------------------------------------------
+    # Prompt builder
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_prompt(report: DexBotReport) -> str:
+        """Serialise the full report into a dense, LLM-readable prompt."""
+        t = report.token
+        s = report.social
+        tr = report.trading
+        r = report.risk
+
+        lines = [
+            "=== Token Analysis Data ===",
+            f"Token        : {t.name} ({t.symbol}) on {t.chain}",
+            f"Address      : {t.address}",
+            f"Price (USD)  : {t.price_usd:.8f}",
+            f"Market Cap   : ${t.market_cap_usd:,.0f}",
+            f"Liquidity    : ${t.liquidity_usd:,.0f}",
+            f"24h Volume   : ${t.volume_24h_usd:,.0f}",
+            f"Token Age    : {t.age_days:.0f} days",
+            f"Holder Count : {t.holder_count:,}",
+            f"Top-10 Wallets Hold: {t.top10_pct:.1f}%",
+            f"Contract Verified: {t.contract_verified}",
+            "",
+            "=== Social Metrics ===",
+            f"Twitter Followers : {s.twitter_followers:,}",
+            f"Reddit Subscribers: {s.reddit_subscribers:,}",
+            f"Reddit Posts (48h): {s.reddit_posts_24h}",
+            f"Telegram Members  : {s.telegram_members:,}",
+            f"Social Hype Score : {s.hype_score:.1f}/10",
+            f"Sentiment Score   : {s.sentiment_score:.2f} (0=bearish, 1=bullish)",
+            "",
+            "=== On-Chain Trading Activity (24 h) ===",
+            f"Total Transactions  : {tr.total_txns_24h}",
+            f"Unique Traders      : {tr.unique_traders_24h}",
+            f"Est. Bot Traffic    : {tr.bot_tx_pct:.0%}",
+            f"Whale Volume Share  : {tr.whale_tx_pct:.0%}",
+            f"Insider Pattern Flag: {tr.insider_flag}",
+            f"Avg Tx Interval     : {tr.avg_tx_interval_secs:.1f}s",
+            "",
+            "=== Security / Rug-Pull Risk ===",
+            f"Rug Risk Score     : {r.rug_risk_score:.1f}/10  (10 = highest risk)",
+            f"Honeypot Detected  : {r.honeypot_flag}",
+            f"Liquidity Locked   : {r.liquidity_locked}",
+            f"Owner Renounced    : {r.owner_renounced}",
+            f"Buy Tax            : {r.buy_tax_pct:.1f}%",
+            f"Sell Tax           : {r.sell_tax_pct:.1f}%",
+            f"Risk Flags         : {', '.join(r.risk_flags) if r.risk_flags else 'None'}",
+            "",
+            "=== Heuristic Analysis (pre-LLM) ===",
+            f"Composite Score    : {report.score:.1f}/100",
+            f"Heuristic Decision : {report.recommendation.upper()}",
+            f"Heuristic Notes    : {'; '.join(report.reasoning)}",
+        ]
+        return "\n".join(lines)

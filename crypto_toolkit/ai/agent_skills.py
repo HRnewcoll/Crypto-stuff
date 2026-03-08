@@ -364,6 +364,37 @@ class VanityAddressSkill(AgentSkill):
         return {"found": False, "message": "Not found within attempt budget."}
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AIDexBotAnalyseInput(BaseModel):
+    token_address: str
+    chain: str = "ethereum"
+    model: str = "gpt-4o-mini"
+
+
+class AIDexBotAnalyseSkill(AgentSkill):
+    name = "ai_dex_bot_analyse"
+    description = (
+        "Analyse a token using the AI DEX Bot: collects on-chain metrics, "
+        "social hype, whale/bot/insider activity, and rug-pull risk, then "
+        "passes everything to an LLM for a deeper, reasoning-based "
+        "buy/sell/avoid/hold recommendation.  Falls back to heuristic "
+        "scoring automatically when no LLM API key is configured."
+    )
+    input_schema = AIDexBotAnalyseInput
+
+    async def execute(
+        self,
+        token_address: str,
+        chain: str = "ethereum",
+        model: str = "gpt-4o-mini",
+    ) -> dict:
+        from crypto_toolkit.trading.dex_bot import AIDexBot
+        bot = AIDexBot(model=model)
+        report = await bot.analyse(token_address, chain=chain)
+        return report.to_dict()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Registry
 # ─────────────────────────────────────────────────────────────────────────────
@@ -379,6 +410,7 @@ TOOL_REGISTRY: dict[str, AgentSkill] = {
         FindArbitrageSkill(),
         TraceFundsSkill(),
         DexBotAnalyseSkill(),
+        AIDexBotAnalyseSkill(),
         VanityAddressSkill(),
     ]
 }
