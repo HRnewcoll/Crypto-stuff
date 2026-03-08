@@ -369,17 +369,18 @@ class VanityAddressSkill(AgentSkill):
 class AIDexBotAnalyseInput(BaseModel):
     token_address: str
     chain: str = "ethereum"
-    model: str = "gpt-4o-mini"
 
 
 class AIDexBotAnalyseSkill(AgentSkill):
     name = "ai_dex_bot_analyse"
     description = (
-        "Analyse a token using the AI DEX Bot: collects on-chain metrics, "
-        "social hype, whale/bot/insider activity, and rug-pull risk, then "
-        "passes everything to an LLM for a deeper, reasoning-based "
-        "buy/sell/avoid/hold recommendation.  Falls back to heuristic "
-        "scoring automatically when no LLM API key is configured."
+        "Analyse a token using the locally self-trained AI DEX Bot: collects "
+        "on-chain metrics, social hype, whale/bot/insider activity, and "
+        "rug-pull risk, then applies a Random Forest + Gradient Boosting "
+        "ensemble model trained entirely from synthetic data.  Returns a "
+        "data-driven buy/sell/avoid/hold recommendation with a feature-"
+        "importance narrative.  No external API key or LLM required – the "
+        "model trains and runs 100 % locally."
     )
     input_schema = AIDexBotAnalyseInput
 
@@ -387,10 +388,9 @@ class AIDexBotAnalyseSkill(AgentSkill):
         self,
         token_address: str,
         chain: str = "ethereum",
-        model: str = "gpt-4o-mini",
     ) -> dict:
         from crypto_toolkit.trading.dex_bot import AIDexBot
-        bot = AIDexBot(model=model)
+        bot = AIDexBot()
         report = await bot.analyse(token_address, chain=chain)
         return report.to_dict()
 

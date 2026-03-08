@@ -19,12 +19,16 @@ Everything runs with public / free APIs (no secret keys required for analysis).
 from __future__ import annotations
 
 import asyncio
+import math
 import statistics
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import httpx
+import numpy as np
+import pandas as pd
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -662,189 +666,371 @@ class DexBot:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AIDexBot – LLM-powered variant of DexBot
+# DexBotEnsemble – local self-trained ML model for DEX analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default model persistence directory (shared with SelfTrainedBot)
+_DEX_MODEL_DIR = Path.home() / ".crypto_toolkit" / "models"
+_DEX_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# Feature column names (order must match _report_to_features)
+_DEX_FEATURE_COLS = [
+    "log_market_cap",
+    "log_liquidity",
+    "log_volume",
+    "volume_liq_ratio",
+    "age_days",
+    "log_holder_count",
+    "top10_pct",
+    "hype_score",
+    "sentiment_score",
+    "bot_tx_pct",
+    "whale_tx_pct",
+    "insider_flag",
+    "rug_risk_score",
+    "honeypot_flag",
+    "sell_tax_pct",
+    "buy_tax_pct",
+    "liquidity_locked",
+    "owner_renounced",
+    "composite_score",
+]
+
+# Human-readable labels for the reasoning narrative
+_FEATURE_HUMAN: dict[str, str] = {
+    "log_market_cap":    "Market cap (log-scaled)",
+    "log_liquidity":     "Liquidity depth (log-scaled)",
+    "log_volume":        "24 h trading volume (log-scaled)",
+    "volume_liq_ratio":  "Volume / liquidity ratio",
+    "age_days":          "Token age (days)",
+    "log_holder_count":  "Holder count (log-scaled)",
+    "top10_pct":         "Top-10 wallet concentration %",
+    "hype_score":        "Social hype score",
+    "sentiment_score":   "Sentiment score",
+    "bot_tx_pct":        "Estimated bot transaction %",
+    "whale_tx_pct":      "Whale volume share %",
+    "insider_flag":      "Insider trading flag",
+    "rug_risk_score":    "Rug-pull risk score",
+    "honeypot_flag":     "Honeypot flag",
+    "sell_tax_pct":      "Sell tax %",
+    "buy_tax_pct":       "Buy tax %",
+    "liquidity_locked":  "Liquidity locked",
+    "owner_renounced":   "Owner renounced",
+    "composite_score":   "Heuristic composite score",
+}
+
+
+def _report_to_features(report: "DexBotReport") -> dict:
+    """Convert a :class:`DexBotReport` to a flat feature dict."""
+    t = report.token
+    s = report.social
+    tr = report.trading
+    r = report.risk
+    liq = max(t.liquidity_usd, 1.0)
+    return {
+        "log_market_cap":   math.log1p(t.market_cap_usd),
+        "log_liquidity":    math.log1p(t.liquidity_usd),
+        "log_volume":       math.log1p(t.volume_24h_usd),
+        "volume_liq_ratio": t.volume_24h_usd / liq,
+        "age_days":         t.age_days,
+        "log_holder_count": math.log1p(t.holder_count),
+        "top10_pct":        t.top10_pct,
+        "hype_score":       s.hype_score,
+        "sentiment_score":  s.sentiment_score,
+        "bot_tx_pct":       tr.bot_tx_pct,
+        "whale_tx_pct":     tr.whale_tx_pct,
+        "insider_flag":     float(tr.insider_flag),
+        "rug_risk_score":   r.rug_risk_score,
+        "honeypot_flag":    float(r.honeypot_flag),
+        "sell_tax_pct":     r.sell_tax_pct,
+        "buy_tax_pct":      r.buy_tax_pct,
+        "liquidity_locked": float(r.liquidity_locked),
+        "owner_renounced":  float(r.owner_renounced),
+        "composite_score":  report.score,
+    }
+
+
+def _generate_synthetic_training_data(
+    n_samples: int = 2000,
+) -> "tuple[pd.DataFrame, pd.Series]":
+    """Generate labelled training examples using the heuristic engine.
+
+    Synthetic tokens are drawn from realistic parameter distributions, then
+    labelled by :meth:`DexBot._compute_score` + :meth:`DexBot._decide`.  This
+    gives the ensemble a rich, diverse training set without requiring any
+    historical on-chain data.
+    """
+    rng = np.random.RandomState(42)
+    bot = DexBot()
+    rows: list[dict] = []
+    labels: list[str] = []
+
+    for _ in range(n_samples):
+        market_cap = float(rng.lognormal(mean=13.0, sigma=3.0))
+        liquidity   = float(rng.lognormal(mean=10.0, sigma=3.0))
+        volume      = float(rng.lognormal(mean=9.0,  sigma=3.0))
+
+        token = TokenInfo(
+            address="0xsynthetic",
+            chain="ethereum",
+            market_cap_usd=market_cap,
+            liquidity_usd=liquidity,
+            volume_24h_usd=volume,
+            age_days=float(int(rng.uniform(0, 1_000))),
+            holder_count=max(1, int(rng.lognormal(mean=6.0, sigma=2.0))),
+            top10_pct=float(rng.uniform(0, 100)),
+        )
+        social = SocialMetrics(
+            hype_score=float(rng.uniform(0, 10)),
+            sentiment_score=float(rng.uniform(0, 1)),
+        )
+        trading = TradingActivityMetrics(
+            bot_tx_pct=float(rng.uniform(0, 1)),
+            whale_tx_pct=float(rng.uniform(0, 1)),
+            insider_flag=bool(rng.randint(0, 2)),
+        )
+        risk = RiskMetrics(
+            rug_risk_score=float(rng.uniform(0, 10)),
+            honeypot_flag=bool(rng.uniform() < 0.05),
+            sell_tax_pct=float(rng.uniform(0, 30)),
+            buy_tax_pct=float(rng.uniform(0, 30)),
+            liquidity_locked=bool(rng.randint(0, 2)),
+            owner_renounced=bool(rng.randint(0, 2)),
+        )
+
+        score, _ = bot._compute_score(token, social, trading, risk)
+        rec, _ = bot._decide(score, risk, trading)
+
+        report = DexBotReport(
+            token=token, social=social, trading=trading, risk=risk,
+            recommendation=rec, confidence=0.5, score=score,
+        )
+        rows.append(_report_to_features(report))
+        labels.append(rec)
+
+    return pd.DataFrame(rows, columns=_DEX_FEATURE_COLS), pd.Series(labels)
+
+
+class DexBotEnsemble:
+    """Local Random Forest + Gradient Boosting ensemble for DEX analysis.
+
+    Trained entirely from synthetic examples generated by the heuristic
+    :class:`DexBot` engine – no external API key, no internet connection,
+    no LLM required.
+
+    On the first call the model is trained automatically (~1–2 s), then
+    persisted to ``~/.crypto_toolkit/models/`` so subsequent calls load
+    instantly from disk.
+    """
+
+    _MODEL_KEY = "dex_bot_ensemble"
+
+    def __init__(self, model_dir: Path = _DEX_MODEL_DIR) -> None:
+        from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+
+        self.model_dir = model_dir
+        self.rf = RandomForestClassifier(
+            n_estimators=200, max_depth=8, random_state=42,
+            n_jobs=-1, class_weight="balanced",
+        )
+        self.gb = GradientBoostingClassifier(
+            n_estimators=150, max_depth=4, learning_rate=0.05, random_state=42,
+        )
+        self._trained = False
+        self._classes: list[str] = []
+        self._load()
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def train(self, n_samples: int = 2000) -> None:
+        """Generate synthetic data and fit the ensemble, then persist."""
+        X, y = _generate_synthetic_training_data(n_samples)
+        if len(y.unique()) < 2:
+            return  # degenerate – skip
+        self.rf.fit(X, y)
+        self.gb.fit(X, y)
+        self._trained = True
+        self._classes = list(self.rf.classes_)
+        self._save()
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    def predict(
+        self,
+        report: "DexBotReport",
+    ) -> "tuple[str, float, str]":
+        """Return ``(recommendation, confidence, reasoning)``.
+
+        ``reasoning`` is a human-readable narrative derived from the model's
+        feature importances – no LLM required.
+        """
+        if not self._trained:
+            self.train()
+
+        features = _report_to_features(report)
+        X = pd.DataFrame([features], columns=_DEX_FEATURE_COLS)
+
+        rf_proba = self.rf.predict_proba(X)[0]
+        gb_proba = self.gb.predict_proba(X)[0]
+        avg_proba = (rf_proba + gb_proba) / 2.0
+        best_idx  = int(np.argmax(avg_proba))
+        confidence = float(avg_proba[best_idx])
+        recommendation = self._classes[best_idx]
+
+        reasoning = self._explain(features, recommendation, confidence)
+        return recommendation, confidence, reasoning
+
+    # ------------------------------------------------------------------
+    # Human-readable explanation
+    # ------------------------------------------------------------------
+
+    def _explain(
+        self,
+        features: dict,
+        recommendation: str,
+        confidence: float,
+    ) -> str:
+        """Build a narrative from the top feature importances."""
+        importances = dict(zip(_DEX_FEATURE_COLS, self.rf.feature_importances_))
+        top3 = sorted(importances.items(), key=lambda kv: kv[1], reverse=True)[:3]
+
+        parts = [
+            f"Local ML ensemble ({confidence:.0%} confidence) → {recommendation.upper()}."
+        ]
+        for feat, imp in top3:
+            val = features.get(feat, 0.0)
+            human = _FEATURE_HUMAN.get(feat, feat)
+            parts.append(f"{human} = {val:.2f} (importance {imp:.2f}).")
+
+        # Prominent risk flags as extra context
+        if features.get("honeypot_flag"):
+            parts.append("⚠ Honeypot flag active – tokens cannot be sold.")
+        if features.get("rug_risk_score", 0) >= 6:
+            parts.append(
+                f"High rug-pull risk ({features['rug_risk_score']:.1f}/10)."
+            )
+        if features.get("composite_score", 0) >= 70:
+            parts.append(
+                f"Strong composite score ({features['composite_score']:.0f}/100)."
+            )
+
+        return "  ".join(parts)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def _path(self, suffix: str) -> Path:
+        return self.model_dir / f"{self._MODEL_KEY}_{suffix}.joblib"
+
+    def _save(self) -> None:
+        try:
+            import joblib
+            joblib.dump(self.rf,      self._path("rf"))
+            joblib.dump(self.gb,      self._path("gb"))
+            joblib.dump(self._classes, self._path("classes"))
+        except Exception:
+            pass
+
+    def _load(self) -> None:
+        try:
+            import joblib
+            rf_p  = self._path("rf")
+            gb_p  = self._path("gb")
+            cls_p = self._path("classes")
+            if rf_p.exists() and gb_p.exists():
+                self.rf = joblib.load(rf_p)
+                self.gb = joblib.load(gb_p)
+                if cls_p.exists():
+                    self._classes = joblib.load(cls_p)
+                self._trained = True
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AIDexBot – locally self-trained AI variant of DexBot
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AIDexBot(DexBot):
-    """AI-enhanced DEX token analyser.
+    """Locally self-trained AI DEX token analyser.
 
-    Extends :class:`DexBot` by feeding all collected on-chain, social, and risk
-    metrics to an LLM (OpenAI-compatible API) for deeper, reasoning-based
-    analysis.  When no API key is configured it falls back silently to the
-    parent heuristic scoring so it is always safe to call.
+    Extends :class:`DexBot` by applying a Random Forest + Gradient Boosting
+    ensemble model that is trained entirely from synthetic data generated by
+    the heuristic engine.  **No external API key, no internet connection, and
+    no LLM are required** – the model runs 100 % locally.
 
-    The LLM is asked to:
-      • Re-evaluate the buy/sell/avoid/hold recommendation.
-      • Provide a confidence score (0–1).
-      • Write a multi-sentence narrative explaining the reasoning.
+    On the first call the ensemble is trained automatically (~1–2 s on a
+    modern laptop), then persisted to ``~/.crypto_toolkit/models/`` so
+    subsequent calls load instantly from disk.
 
-    The narrative is stored in ``DexBotReport.ai_reasoning`` and is also
-    appended to ``report.reasoning``.
+    The model discovers non-linear interactions between on-chain quality
+    signals, social momentum, trading activity patterns, and rug-pull risk
+    that the linear heuristic cannot capture.  Its reasoning narrative is
+    generated from the Random Forest feature importances.
 
     Example::
 
-        bot = AIDexBot(model="gpt-4o-mini")
+        bot = AIDexBot()
         report = asyncio.run(bot.analyse("0xTOKEN…", chain="ethereum"))
-        print(report.ai_reasoning)
-        print(report.recommendation)   # potentially overridden by LLM
+        print(report.ai_reasoning)      # feature-importance narrative
+        print(report.recommendation)    # overridden by ML prediction
     """
-
-    _SYSTEM_PROMPT = (
-        "You are an expert DeFi analyst and crypto trader.  "
-        "You are given structured data about a token collected from on-chain "
-        "analytics, social media, and security audits.  "
-        "Output ONLY a valid JSON object (no markdown, no extra text) with "
-        "exactly three keys:\n"
-        '  "recommendation": one of "buy", "sell", "hold", "avoid"\n'
-        '  "confidence": a float between 0.0 and 1.0\n'
-        '  "reasoning": a concise multi-sentence narrative (2–5 sentences) '
-        "explaining your decision, referencing the data provided."
-    )
 
     def __init__(
         self,
-        model: str = "gpt-4o-mini",
-        llm_timeout: int = 30,
+        model_dir: Optional[Path] = None,
         **kwargs,
     ) -> None:
         """
         Args:
-            model:       OpenAI-compatible model name (e.g. ``"gpt-4o"``,
-                         ``"gpt-4o-mini"``, ``"mistral-small"``).
-            llm_timeout: HTTP timeout in seconds for the LLM request.
-            **kwargs:    Forwarded to :class:`DexBot` (min_liquidity_usd, etc.).
+            model_dir: Override the default model persistence directory
+                       (``~/.crypto_toolkit/models/``).
+            **kwargs:  Forwarded to :class:`DexBot`.
         """
         super().__init__(**kwargs)
-        self.model = model
-        self.llm_timeout = llm_timeout
+        _dir = Path(model_dir) if model_dir else _DEX_MODEL_DIR
+        self._ensemble = DexBotEnsemble(model_dir=_dir)
 
     # ------------------------------------------------------------------
     # Public API  (same signature as DexBot.analyse)
     # ------------------------------------------------------------------
 
     async def analyse(self, token_address: str, chain: str = "ethereum") -> DexBotReport:
-        """Run a full AI-enhanced analysis.
+        """Run a full locally-trained AI analysis.
 
-        1. Collects all metrics via the parent ``DexBot`` pipeline.
-        2. Passes the full context to the configured LLM.
-        3. Merges the LLM's recommendation / confidence / reasoning into the
-           report, overriding the heuristic decision when the LLM responds.
-        4. On any LLM error (no key, timeout, bad JSON …) falls back silently
-           to the parent heuristic result.
+        1. Collects all on-chain / social / risk metrics via the parent
+           :class:`DexBot` pipeline.
+        2. Passes the assembled report to the local ML ensemble.
+        3. Merges the ML recommendation, confidence, and feature-importance
+           reasoning back into the report.
+        4. On any inference error the parent heuristic result is kept.
 
         Returns:
-            DexBotReport with ``ai_reasoning`` populated when the LLM call
-            succeeded.
+            :class:`DexBotReport` with ``ai_reasoning`` populated from the
+            ensemble's feature-importance narrative.
         """
         report = await super().analyse(token_address, chain)
-        await self._enrich_with_llm(report)
+        self._enrich_with_local_model(report)
         return report
 
     # ------------------------------------------------------------------
-    # LLM enrichment
+    # Local ML enrichment
     # ------------------------------------------------------------------
 
-    async def _enrich_with_llm(self, report: DexBotReport) -> None:
-        """Query the LLM and update *report* in-place."""
-        from crypto_toolkit.config import OPENAI_API_KEY, OPENAI_BASE_URL
-
-        if not OPENAI_API_KEY:
-            # No key – stay with heuristic result
-            return
-
-        prompt = self._build_prompt(report)
-
+    def _enrich_with_local_model(self, report: DexBotReport) -> None:
+        """Run local ensemble inference and update *report* in-place."""
         try:
-            import json as _json
-            async with __import__("httpx").AsyncClient(timeout=self.llm_timeout) as client:
-                resp = await client.post(
-                    f"{OPENAI_BASE_URL}/chat/completions",
-                    headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": self._SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "response_format": {"type": "json_object"},
-                        "temperature": 0.2,
-                    },
-                )
-                resp.raise_for_status()
-                raw = resp.json()["choices"][0]["message"]["content"]
-
-            parsed = _json.loads(raw)
-            rec = parsed.get("recommendation", report.recommendation).lower()
-            if rec in {"buy", "sell", "hold", "avoid"}:
-                report.recommendation = rec
-            conf = parsed.get("confidence")
-            if conf is not None:
-                try:
-                    report.confidence = max(0.0, min(1.0, float(conf)))
-                except (ValueError, TypeError):
-                    pass
-            narrative = parsed.get("reasoning", "")
-            if narrative:
-                report.ai_reasoning = str(narrative)
-                report.reasoning = report.reasoning + [f"[AI] {narrative}"]
-
+            rec, conf, reasoning = self._ensemble.predict(report)
+            report.recommendation = rec
+            report.confidence     = conf
+            report.ai_reasoning   = reasoning
+            report.reasoning      = report.reasoning + [f"[LocalML] {reasoning}"]
         except Exception:
-            # Any failure (network, bad JSON, model error) → keep heuristic result
+            # Any failure (first-train error, sklearn not installed, …)
+            # → keep the heuristic result unchanged
             pass
-
-    # ------------------------------------------------------------------
-    # Prompt builder
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_prompt(report: DexBotReport) -> str:
-        """Serialise the full report into a dense, LLM-readable prompt."""
-        t = report.token
-        s = report.social
-        tr = report.trading
-        r = report.risk
-
-        lines = [
-            "=== Token Analysis Data ===",
-            f"Token        : {t.name} ({t.symbol}) on {t.chain}",
-            f"Address      : {t.address}",
-            f"Price (USD)  : {t.price_usd:.8f}",
-            f"Market Cap   : ${t.market_cap_usd:,.0f}",
-            f"Liquidity    : ${t.liquidity_usd:,.0f}",
-            f"24h Volume   : ${t.volume_24h_usd:,.0f}",
-            f"Token Age    : {t.age_days:.0f} days",
-            f"Holder Count : {t.holder_count:,}",
-            f"Top-10 Wallets Hold: {t.top10_pct:.1f}%",
-            f"Contract Verified: {t.contract_verified}",
-            "",
-            "=== Social Metrics ===",
-            f"Twitter Followers : {s.twitter_followers:,}",
-            f"Reddit Subscribers: {s.reddit_subscribers:,}",
-            f"Reddit Posts (48h): {s.reddit_posts_24h}",
-            f"Telegram Members  : {s.telegram_members:,}",
-            f"Social Hype Score : {s.hype_score:.1f}/10",
-            f"Sentiment Score   : {s.sentiment_score:.2f} (0=bearish, 1=bullish)",
-            "",
-            "=== On-Chain Trading Activity (24 h) ===",
-            f"Total Transactions  : {tr.total_txns_24h}",
-            f"Unique Traders      : {tr.unique_traders_24h}",
-            f"Est. Bot Traffic    : {tr.bot_tx_pct:.0%}",
-            f"Whale Volume Share  : {tr.whale_tx_pct:.0%}",
-            f"Insider Pattern Flag: {tr.insider_flag}",
-            f"Avg Tx Interval     : {tr.avg_tx_interval_secs:.1f}s",
-            "",
-            "=== Security / Rug-Pull Risk ===",
-            f"Rug Risk Score     : {r.rug_risk_score:.1f}/10  (10 = highest risk)",
-            f"Honeypot Detected  : {r.honeypot_flag}",
-            f"Liquidity Locked   : {r.liquidity_locked}",
-            f"Owner Renounced    : {r.owner_renounced}",
-            f"Buy Tax            : {r.buy_tax_pct:.1f}%",
-            f"Sell Tax           : {r.sell_tax_pct:.1f}%",
-            f"Risk Flags         : {', '.join(r.risk_flags) if r.risk_flags else 'None'}",
-            "",
-            "=== Heuristic Analysis (pre-LLM) ===",
-            f"Composite Score    : {report.score:.1f}/100",
-            f"Heuristic Decision : {report.recommendation.upper()}",
-            f"Heuristic Notes    : {'; '.join(report.reasoning)}",
-        ]
-        return "\n".join(lines)

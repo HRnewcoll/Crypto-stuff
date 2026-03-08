@@ -570,9 +570,9 @@ class TestDexBot:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAIDexBot:
-    """Tests for the LLM-enhanced AIDexBot variant."""
+    """Tests for the locally self-trained AIDexBot variant."""
 
-    def _make_dummy_report(self):
+    def _make_dummy_report(self, **overrides):
         from crypto_toolkit.trading.dex_bot import (
             DexBotReport, TokenInfo, SocialMetrics,
             TradingActivityMetrics, RiskMetrics,
@@ -581,13 +581,24 @@ class TestAIDexBot:
             token=TokenInfo(
                 address="0x" + "ab" * 20, chain="ethereum",
                 name="MockToken", symbol="MCK",
-                price_usd=0.001, market_cap_usd=200_000,
-                liquidity_usd=30_000, volume_24h_usd=8_000,
-                age_days=20, holder_count=400,
+                price_usd=0.001,
+                market_cap_usd=overrides.get("market_cap_usd", 200_000),
+                liquidity_usd=overrides.get("liquidity_usd", 30_000),
+                volume_24h_usd=overrides.get("volume_24h_usd", 8_000),
+                age_days=overrides.get("age_days", 20),
+                holder_count=overrides.get("holder_count", 400),
             ),
-            social=SocialMetrics(hype_score=5.0, sentiment_score=0.55),
-            trading=TradingActivityMetrics(bot_tx_pct=0.25),
-            risk=RiskMetrics(rug_risk_score=2.5),
+            social=SocialMetrics(
+                hype_score=overrides.get("hype_score", 5.0),
+                sentiment_score=0.55,
+            ),
+            trading=TradingActivityMetrics(
+                bot_tx_pct=overrides.get("bot_tx_pct", 0.25),
+            ),
+            risk=RiskMetrics(
+                rug_risk_score=overrides.get("rug_risk_score", 2.5),
+                honeypot_flag=overrides.get("honeypot_flag", False),
+            ),
             recommendation="hold",
             confidence=0.5,
             score=52.0,
@@ -600,15 +611,17 @@ class TestAIDexBot:
         from crypto_toolkit.trading.dex_bot import AIDexBot, DexBot
         assert issubclass(AIDexBot, DexBot)
 
-    def test_ai_dex_bot_default_model(self):
+    def test_ai_dex_bot_no_llm_attributes(self):
+        """AIDexBot must not carry LLM-specific attributes."""
         from crypto_toolkit.trading.dex_bot import AIDexBot
         bot = AIDexBot()
-        assert bot.model == "gpt-4o-mini"
+        assert not hasattr(bot, "model"), "model attr should not exist on AIDexBot"
+        assert not hasattr(bot, "llm_timeout"), "llm_timeout attr should not exist"
 
-    def test_ai_dex_bot_custom_model(self):
-        from crypto_toolkit.trading.dex_bot import AIDexBot
-        bot = AIDexBot(model="gpt-4o")
-        assert bot.model == "gpt-4o"
+    def test_ai_dex_bot_has_ensemble(self):
+        from crypto_toolkit.trading.dex_bot import AIDexBot, DexBotEnsemble
+        bot = AIDexBot()
+        assert isinstance(bot._ensemble, DexBotEnsemble)
 
     def test_ai_reasoning_field_defaults_to_none(self):
         report = self._make_dummy_report()
@@ -616,10 +629,10 @@ class TestAIDexBot:
 
     def test_report_to_dict_includes_ai_reasoning(self):
         report = self._make_dummy_report()
-        report.ai_reasoning = "LLM says buy."
+        report.ai_reasoning = "Local ML says buy."
         d = report.to_dict()
         assert "ai_reasoning" in d
-        assert d["ai_reasoning"] == "LLM says buy."
+        assert d["ai_reasoning"] == "Local ML says buy."
 
     def test_report_to_text_includes_ai_section(self):
         report = self._make_dummy_report()
@@ -634,151 +647,118 @@ class TestAIDexBot:
         text = report.to_text()
         assert "AI Analysis" not in text
 
-    # ── Prompt builder ─────────────────────────────────────────────────────────
+    # ── Feature engineering ────────────────────────────────────────────────────
 
-    def test_build_prompt_contains_token_info(self):
-        from crypto_toolkit.trading.dex_bot import AIDexBot
+    def test_report_to_features_returns_all_columns(self):
+        from crypto_toolkit.trading.dex_bot import _report_to_features, _DEX_FEATURE_COLS
         report = self._make_dummy_report()
-        prompt = AIDexBot._build_prompt(report)
-        assert "MCK" in prompt
-        assert "ethereum" in prompt.lower()
+        features = _report_to_features(report)
+        for col in _DEX_FEATURE_COLS:
+            assert col in features, f"Missing feature: {col}"
 
-    def test_build_prompt_contains_social_metrics(self):
-        from crypto_toolkit.trading.dex_bot import AIDexBot
+    def test_report_to_features_types_are_float(self):
+        from crypto_toolkit.trading.dex_bot import _report_to_features
         report = self._make_dummy_report()
-        prompt = AIDexBot._build_prompt(report)
-        assert "Hype Score" in prompt or "hype" in prompt.lower()
+        features = _report_to_features(report)
+        for k, v in features.items():
+            assert isinstance(v, (int, float)), f"Feature {k} is not numeric: {type(v)}"
 
-    def test_build_prompt_contains_risk_section(self):
-        from crypto_toolkit.trading.dex_bot import AIDexBot
+    def test_report_to_features_log_market_cap(self):
+        from crypto_toolkit.trading.dex_bot import _report_to_features
+        import math
+        report = self._make_dummy_report(market_cap_usd=200_000)
+        features = _report_to_features(report)
+        assert features["log_market_cap"] == pytest.approx(math.log1p(200_000))
+
+    def test_report_to_features_honeypot_is_float(self):
+        from crypto_toolkit.trading.dex_bot import _report_to_features
+        report = self._make_dummy_report(honeypot_flag=True)
+        features = _report_to_features(report)
+        assert features["honeypot_flag"] == 1.0
+
+    # ── DexBotEnsemble ─────────────────────────────────────────────────────────
+
+    def test_ensemble_trains_and_is_trained(self, tmp_path):
+        from crypto_toolkit.trading.dex_bot import DexBotEnsemble
+        ens = DexBotEnsemble(model_dir=tmp_path)
+        assert not ens._trained
+        ens.train(n_samples=300)   # small sample for speed
+        assert ens._trained
+
+    def test_ensemble_predict_returns_valid_recommendation(self, tmp_path):
+        from crypto_toolkit.trading.dex_bot import DexBotEnsemble
+        ens = DexBotEnsemble(model_dir=tmp_path)
+        ens.train(n_samples=300)
         report = self._make_dummy_report()
-        prompt = AIDexBot._build_prompt(report)
-        assert "Rug Risk" in prompt
+        rec, conf, reasoning = ens.predict(report)
+        assert rec in {"buy", "sell", "hold", "avoid"}
+        assert 0.0 <= conf <= 1.0
+        assert isinstance(reasoning, str) and len(reasoning) > 10
 
-    def test_build_prompt_contains_heuristic_decision(self):
-        from crypto_toolkit.trading.dex_bot import AIDexBot
+    def test_ensemble_reasoning_contains_recommendation(self, tmp_path):
+        from crypto_toolkit.trading.dex_bot import DexBotEnsemble
+        ens = DexBotEnsemble(model_dir=tmp_path)
+        ens.train(n_samples=300)
         report = self._make_dummy_report()
-        prompt = AIDexBot._build_prompt(report)
-        assert "HOLD" in prompt or "hold" in prompt
+        rec, conf, reasoning = ens.predict(report)
+        assert rec.upper() in reasoning
 
-    # ── LLM enrichment with mock ───────────────────────────────────────────────
+    def test_ensemble_persists_and_reloads(self, tmp_path):
+        from crypto_toolkit.trading.dex_bot import DexBotEnsemble
+        ens1 = DexBotEnsemble(model_dir=tmp_path)
+        ens1.train(n_samples=300)
+        # A fresh instance loading from same dir should be trained
+        ens2 = DexBotEnsemble(model_dir=tmp_path)
+        assert ens2._trained
 
-    @pytest.mark.asyncio
-    async def test_enrich_with_llm_overrides_recommendation(self):
-        """When LLM returns 'buy', recommendation must be updated."""
-        import json
-        from crypto_toolkit.trading.dex_bot import AIDexBot
+    def test_ensemble_predict_on_honeypot_mentions_flag(self, tmp_path):
+        from crypto_toolkit.trading.dex_bot import DexBotEnsemble
+        ens = DexBotEnsemble(model_dir=tmp_path)
+        ens.train(n_samples=300)
+        report = self._make_dummy_report(honeypot_flag=True, rug_risk_score=9.5)
+        _, _, reasoning = ens.predict(report)
+        # Honeypot and/or high rug risk should appear in the narrative
+        assert "honeypot" in reasoning.lower() or "rug" in reasoning.lower()
 
-        bot = AIDexBot()
+    # ── _enrich_with_local_model ───────────────────────────────────────────────
+
+    def test_enrich_with_local_model_overrides_recommendation(self, tmp_path):
+        from crypto_toolkit.trading.dex_bot import AIDexBot, DexBotEnsemble
+        bot = AIDexBot(model_dir=tmp_path)
+        # Pre-train the ensemble
+        bot._ensemble.train(n_samples=300)
         report = self._make_dummy_report()
-        assert report.recommendation == "hold"
-
-        fake_llm_response = json.dumps({
-            "recommendation": "buy",
-            "confidence": 0.82,
-            "reasoning": "Strong liquidity and low rug risk make this an attractive entry.",
-        })
-
-        with patch("crypto_toolkit.config.OPENAI_API_KEY", "sk-fake-key"), \
-             patch("crypto_toolkit.config.OPENAI_BASE_URL", "https://api.openai.com/v1"):
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": fake_llm_response}}]
-            }
-            mock_resp.raise_for_status = MagicMock()
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_resp)
-
-            with patch("httpx.AsyncClient", return_value=mock_client):
-                await bot._enrich_with_llm(report)
-
-        assert report.recommendation == "buy"
-        assert report.confidence == pytest.approx(0.82)
+        bot._enrich_with_local_model(report)
+        # Recommendation is always overridden by ML
+        assert report.recommendation in {"buy", "sell", "hold", "avoid"}
         assert report.ai_reasoning is not None
-        assert "Strong liquidity" in report.ai_reasoning
-        # AI reasoning should also be appended to reasoning list
-        assert any("[AI]" in r for r in report.reasoning)
+        assert any("[LocalML]" in r for r in report.reasoning)
 
-    @pytest.mark.asyncio
-    async def test_enrich_with_llm_no_key_leaves_report_unchanged(self):
-        """Without an API key the report must not be modified."""
+    def test_enrich_with_local_model_silently_fails_on_error(self, tmp_path):
+        """If the ensemble raises an exception, the report must be unchanged."""
         from crypto_toolkit.trading.dex_bot import AIDexBot
-
-        bot = AIDexBot()
+        bot = AIDexBot(model_dir=tmp_path)
+        # Force predict() to raise
+        bot._ensemble.predict = MagicMock(side_effect=RuntimeError("boom"))
         report = self._make_dummy_report()
         original_rec = report.recommendation
-        original_conf = report.confidence
-
-        with patch("crypto_toolkit.config.OPENAI_API_KEY", ""):
-            await bot._enrich_with_llm(report)
-
-        assert report.recommendation == original_rec
-        assert report.confidence == original_conf
-        assert report.ai_reasoning is None
-
-    @pytest.mark.asyncio
-    async def test_enrich_with_llm_bad_json_leaves_report_unchanged(self):
-        """If the LLM returns invalid JSON, fall back silently."""
-        from crypto_toolkit.trading.dex_bot import AIDexBot
-
-        bot = AIDexBot()
-        report = self._make_dummy_report()
-        original_rec = report.recommendation
-
-        with patch("crypto_toolkit.config.OPENAI_API_KEY", "sk-fake-key"), \
-             patch("crypto_toolkit.config.OPENAI_BASE_URL", "https://api.openai.com/v1"):
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": "this is not json {"}}]
-            }
-            mock_resp.raise_for_status = MagicMock()
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_resp)
-
-            with patch("httpx.AsyncClient", return_value=mock_client):
-                await bot._enrich_with_llm(report)
-
+        bot._enrich_with_local_model(report)
         assert report.recommendation == original_rec
         assert report.ai_reasoning is None
 
-    @pytest.mark.asyncio
-    async def test_enrich_with_llm_network_error_leaves_report_unchanged(self):
-        """Network failures must not propagate – fall back silently."""
-        from crypto_toolkit.trading.dex_bot import AIDexBot
-
-        bot = AIDexBot()
-        report = self._make_dummy_report()
-        original_rec = report.recommendation
-
-        with patch("crypto_toolkit.config.OPENAI_API_KEY", "sk-fake-key"), \
-             patch("crypto_toolkit.config.OPENAI_BASE_URL", "https://api.openai.com/v1"):
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(side_effect=Exception("connection refused"))
-
-            with patch("httpx.AsyncClient", return_value=mock_client):
-                await bot._enrich_with_llm(report)
-
-        assert report.recommendation == original_rec
-        assert report.ai_reasoning is None
+    # ── Full async pipeline ────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_analyse_full_pipeline_with_mocked_llm(self):
-        """End-to-end: all data fetchers + LLM mocked."""
-        import json
+    async def test_analyse_full_pipeline_with_local_model(self, tmp_path):
+        """End-to-end: all data fetchers mocked; local ML runs for real."""
         from crypto_toolkit.trading.dex_bot import (
             AIDexBot, TokenInfo, SocialMetrics,
             TradingActivityMetrics, RiskMetrics,
         )
 
-        bot = AIDexBot(model="gpt-4o-mini")
+        bot = AIDexBot(model_dir=tmp_path)
+        # Pre-train with a small sample
+        bot._ensemble.train(n_samples=300)
 
         dummy_token = TokenInfo(
             address="0xtest", chain="ethereum", name="Mock", symbol="MCK",
@@ -786,41 +766,20 @@ class TestAIDexBot:
             liquidity_usd=20_000, volume_24h_usd=5_000,
             age_days=30, holder_count=300,
         )
-        dummy_social = SocialMetrics(hype_score=4.0, sentiment_score=0.5)
-        dummy_trading = TradingActivityMetrics(bot_tx_pct=0.3)
-        dummy_risk = RiskMetrics(rug_risk_score=3.0)
+        dummy_social   = SocialMetrics(hype_score=4.0, sentiment_score=0.5)
+        dummy_trading  = TradingActivityMetrics(bot_tx_pct=0.3)
+        dummy_risk     = RiskMetrics(rug_risk_score=3.0)
 
-        # Mock the parent data-collection helpers
-        bot._fetch_token_info = AsyncMock(return_value=dummy_token)
-        bot._fetch_social_metrics = AsyncMock(return_value=dummy_social)
+        bot._fetch_token_info         = AsyncMock(return_value=dummy_token)
+        bot._fetch_social_metrics     = AsyncMock(return_value=dummy_social)
         bot._analyse_trading_activity = AsyncMock(return_value=dummy_trading)
-        bot._assess_risk = AsyncMock(return_value=dummy_risk)
+        bot._assess_risk              = AsyncMock(return_value=dummy_risk)
 
-        fake_llm_json = json.dumps({
-            "recommendation": "avoid",
-            "confidence": 0.78,
-            "reasoning": "Bot traffic is too high and liquidity is thin.",
-        })
-        with patch("crypto_toolkit.config.OPENAI_API_KEY", "sk-fake-key"), \
-             patch("crypto_toolkit.config.OPENAI_BASE_URL", "https://api.openai.com/v1"):
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": fake_llm_json}}]
-            }
-            mock_resp.raise_for_status = MagicMock()
-            mock_client = AsyncMock()
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            mock_client.post = AsyncMock(return_value=mock_resp)
+        report = await bot.analyse("0xtest", chain="ethereum")
 
-            with patch("httpx.AsyncClient", return_value=mock_client):
-                report = await bot.analyse("0xtest", chain="ethereum")
-
-        assert report.recommendation == "avoid"
-        assert report.confidence == pytest.approx(0.78)
+        assert report.recommendation in {"buy", "sell", "avoid", "hold"}
+        assert 0.0 <= report.confidence <= 1.0
         assert report.ai_reasoning is not None
-        assert "Bot traffic" in report.ai_reasoning
         assert 0.0 <= report.score <= 100.0
 
     # ── Agent skill ────────────────────────────────────────────────────────────
@@ -828,6 +787,14 @@ class TestAIDexBot:
     def test_ai_dex_bot_skill_in_registry(self):
         from crypto_toolkit.ai.agent_skills import TOOL_REGISTRY
         assert "ai_dex_bot_analyse" in TOOL_REGISTRY
+
+    def test_ai_dex_bot_skill_no_model_param(self):
+        """The local-ML skill must not expose a 'model' parameter."""
+        from crypto_toolkit.ai.agent_skills import TOOL_REGISTRY
+        skill = TOOL_REGISTRY["ai_dex_bot_analyse"]
+        schema = skill.openai_schema()
+        props = schema["function"]["parameters"].get("properties", {})
+        assert "model" not in props, "'model' should not be a parameter of the local-ML skill"
 
     def test_ai_dex_bot_skill_openai_schema(self):
         from crypto_toolkit.ai.agent_skills import TOOL_REGISTRY
@@ -837,7 +804,6 @@ class TestAIDexBot:
         assert schema["function"]["name"] == "ai_dex_bot_analyse"
         props = schema["function"]["parameters"].get("properties", {})
         assert "token_address" in props
-        assert "model" in props
 
     def test_ai_dex_bot_skill_anthropic_schema(self):
         from crypto_toolkit.ai.agent_skills import TOOL_REGISTRY
