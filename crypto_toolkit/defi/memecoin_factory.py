@@ -1,10 +1,10 @@
 """
-Memecoin / ERC-20 token factory and deployer.
+Memecoin / token factory and deployer – multi-chain.
 
-Creates and deploys a fully customisable ERC-20 (or BEP-20) token with:
-  - Configurable name, symbol, decimals, and total supply.
-  - Optional: mint/burn, ownership, blacklist, transaction taxes (buy/sell fee).
-  - Optional: liquidity lock helper (add liquidity to Uniswap / PancakeSwap).
+Supports:
+  • EVM chains (Ethereum, BSC, Polygon …) – standard ERC-20 with configurable
+    fees, mint/burn, and Uniswap V2 liquidity helper.
+  • Solana – SPL token creation via the ``solana-py`` or ``spl-token`` CLI.
 
 ⚠  LEGAL & ETHICAL NOTICE:
   Deploying tokens intended to deceive investors (rug pulls, honeypots,
@@ -321,3 +321,182 @@ class MemecoinFactory:
                 "install it with `pip install py-solc-x` for live deployment."
             )
             return self._MINIMAL_ERC20_ABI, ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Solana SPL Token Factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SolanaTokenConfig:
+    name: str
+    symbol: str
+    decimals: int = 9
+    total_supply: int = 1_000_000_000
+    freeze_authority: bool = False
+    mint_authority: Optional[str] = None  # base58 pubkey; None = deployer
+
+
+@dataclass
+class DeployedSolanaToken:
+    mint_address: str
+    name: str
+    symbol: str
+    total_supply: int
+    decimals: int
+    deploy_signature: str
+
+
+class SolanaTokenFactory:
+    """Deploy SPL tokens on Solana.
+
+    Requires ``solana-py`` (``pip install solana``) and a funded keypair.
+
+    Example::
+
+        factory = SolanaTokenFactory(keypair_path="~/.config/solana/id.json")
+        cfg = SolanaTokenConfig(name="MooCow", symbol="MOO", total_supply=1_000_000_000)
+        deployed = factory.deploy(cfg)
+        print(f"Mint: {deployed.mint_address}")
+    """
+
+    def __init__(self, keypair_path: Optional[str] = None, rpc_url: Optional[str] = None) -> None:
+        from crypto_toolkit.config import SOLANA_RPC_URL
+        self.keypair_path = keypair_path
+        self.rpc_url = rpc_url or SOLANA_RPC_URL
+
+    def deploy(self, config: SolanaTokenConfig) -> DeployedSolanaToken:
+        """Create and mint an SPL token.
+
+        Steps:
+        1. Generate a new mint account keypair.
+        2. Create the mint (``initialize_mint``).
+        3. Create the associated token account.
+        4. Mint ``total_supply`` tokens to the deployer.
+
+        Returns:
+            DeployedSolanaToken with mint address.
+        """
+        try:
+            from solana.rpc.api import Client
+            from solana.keypair import Keypair
+            from spl.token.client import Token
+            from spl.token.constants import TOKEN_PROGRAM_ID
+            from solana.publickey import PublicKey
+        except ImportError:
+            raise ImportError(
+                "Install solana-py and spl-token-client: "
+                "pip install solana spl-token"
+            )
+
+        client = Client(self.rpc_url)
+        payer = self._load_keypair()
+        mint_keypair = Keypair()
+
+        token = Token.create_mint(
+            client,
+            payer,
+            mint_keypair,
+            config.decimals,
+            TOKEN_PROGRAM_ID,
+            freeze_authority=PublicKey(config.mint_authority) if config.mint_authority else None,
+        )
+
+        # Create associated token account for the payer
+        ata = token.create_associated_token_account(payer.public_key)
+
+        # Mint total_supply tokens
+        amount = config.total_supply * (10 ** config.decimals)
+        sig = token.mint_to(ata, payer, amount)
+
+        return DeployedSolanaToken(
+            mint_address=str(mint_keypair.public_key),
+            name=config.name,
+            symbol=config.symbol,
+            total_supply=config.total_supply,
+            decimals=config.decimals,
+            deploy_signature=str(sig["result"]),
+        )
+
+    def _load_keypair(self):
+        """Load a Solana Keypair from the JSON file at keypair_path."""
+        import json
+        from pathlib import Path
+        from solana.keypair import Keypair  # type: ignore
+
+        if not self.keypair_path:
+            raise ValueError("keypair_path must be set to deploy Solana tokens.")
+        path = Path(self.keypair_path).expanduser()
+        secret = json.loads(path.read_text())
+        return Keypair.from_secret_key(bytes(secret))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-chain factory router
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EVM_CHAINS = {
+    "ethereum", "bsc", "polygon", "arbitrum", "optimism",
+    "avalanche", "base", "fantom", "cronos",
+}
+
+
+def create_token(
+    chain: str,
+    name: str,
+    symbol: str,
+    private_key: Optional[str] = None,
+    total_supply: int = 1_000_000_000,
+    decimals: int = 18,
+    buy_fee_bps: int = 0,
+    sell_fee_bps: int = 0,
+    **kwargs,
+):
+    """Convenience factory: deploy a token on *chain*.
+
+    Routes to MemecoinFactory (EVM) or SolanaTokenFactory based on chain.
+
+    Args:
+        chain:          Target chain (e.g. "ethereum", "bsc", "solana").
+        name:           Token name.
+        symbol:         Token ticker symbol.
+        private_key:    EVM private key (hex) OR path to Solana keypair JSON.
+        total_supply:   Total token supply (human units, before decimals).
+        decimals:       Token decimals.
+        buy_fee_bps:    Buy fee in basis points (EVM only).
+        sell_fee_bps:   Sell fee in basis points (EVM only).
+        **kwargs:       Extra args forwarded to the factory.
+
+    Returns:
+        DeployedToken (EVM) or DeployedSolanaToken (Solana).
+    """
+    chain_lower = chain.lower()
+
+    if chain_lower == "solana":
+        factory = SolanaTokenFactory(keypair_path=private_key, **kwargs)
+        cfg = SolanaTokenConfig(
+            name=name,
+            symbol=symbol,
+            decimals=decimals,
+            total_supply=total_supply,
+        )
+        return factory.deploy(cfg)
+
+    if chain_lower in _EVM_CHAINS:
+        if not private_key:
+            raise ValueError("private_key is required for EVM deployments.")
+        factory = MemecoinFactory(private_key=private_key)
+        cfg = TokenConfig(
+            name=name,
+            symbol=symbol,
+            decimals=decimals,
+            total_supply=total_supply,
+            buy_fee_bps=buy_fee_bps,
+            sell_fee_bps=sell_fee_bps,
+        )
+        return factory.deploy(cfg, chain=chain_lower)
+
+    raise ValueError(
+        f"Unsupported chain '{chain}'. "
+        f"Supported: {sorted(list(_EVM_CHAINS) + ['solana'])}"
+    )

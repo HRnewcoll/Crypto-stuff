@@ -32,7 +32,7 @@ class TestVanityAddressGenerator:
 
     def test_unsupported_chain_raises(self):
         with pytest.raises(NotImplementedError):
-            self.gen.find(chain="bitcoin", prefix="1ABC")
+            self.gen.find(chain="monero_xmr_unsupported", prefix="ABCD")
 
     def test_find_short_prefix(self):
         # Very short prefix (1 hex char after 0x) should be found quickly

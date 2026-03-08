@@ -26,6 +26,7 @@ pydantic-settings>=2.2.1
 pandas>=2.2.2
 numpy>=1.26.4
 scikit-learn>=1.4.2
+joblib>=1.4.0          # Model persistence for self-trained bot
 ta>=0.11.0           # Technical analysis indicators
 openai>=1.30.0       # AI agent integration (OpenAI-compatible)
 
